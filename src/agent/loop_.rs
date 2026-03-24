@@ -2982,6 +2982,31 @@ pub(crate) async fn run_tool_call_loop(
         } else {
             None
         };
+
+        // Run modifying hook before LLM call
+        let (final_messages, final_model);
+        if let Some(hooks) = hooks {
+            match hooks
+                .run_before_llm_call(
+                    prepared_messages.messages.to_vec(),
+                    active_model.to_string(),
+                )
+                .await
+            {
+                crate::hooks::HookResult::Continue((msgs, mdl)) => {
+                    final_messages = msgs;
+                    final_model = mdl;
+                }
+                crate::hooks::HookResult::Cancel(reason) => {
+                    tracing::warn!(reason = %reason, "LLM call cancelled by before_llm_call hook");
+                    return Err(anyhow::anyhow!("LLM call cancelled by hook: {}", reason));
+                }
+            }
+        } else {
+            final_messages = prepared_messages.messages.to_vec();
+            final_model = active_model.to_string();
+        }
+
         let should_consume_provider_stream = on_delta.is_some()
             && provider.supports_streaming()
             && (request_tools.is_none() || provider.supports_streaming_tool_events());
@@ -2997,9 +3022,9 @@ pub(crate) async fn run_tool_call_loop(
         let chat_result = if should_consume_provider_stream {
             match consume_provider_streaming_response(
                 active_provider,
-                &prepared_messages.messages,
+                &final_messages,
                 request_tools,
-                active_model,
+                &final_model,
                 temperature,
                 cancellation_token.as_ref(),
                 on_delta.as_ref(),
@@ -3040,9 +3065,9 @@ pub(crate) async fn run_tool_call_loop(
                     }
                     call_provider_chat(
                         active_provider,
-                        &prepared_messages.messages,
+                        &final_messages,
                         request_tools,
-                        active_model,
+                        &final_model,
                         temperature,
                         cancellation_token.as_ref(),
                     )
@@ -3054,10 +3079,10 @@ pub(crate) async fn run_tool_call_loop(
             // pacing config to catch hung model responses.
             let chat_future = active_provider.chat(
                 ChatRequest {
-                    messages: &prepared_messages.messages,
+                    messages: &final_messages,
                     tools: request_tools,
                 },
-                active_model,
+                &final_model,
                 temperature,
             );
 
@@ -3129,6 +3154,11 @@ pub(crate) async fn run_tool_call_loop(
                     .usage
                     .as_ref()
                     .and_then(|usage| record_tool_loop_cost_usage(provider_name, model, usage));
+
+                // Fire void hook after LLM response
+                if let Some(hooks) = hooks {
+                    hooks.fire_llm_output(&resp).await;
+                }
 
                 let response_text = resp.text_or_empty().to_string();
                 // First try native structured tool calls (OpenAI-format).
@@ -3841,6 +3871,22 @@ pub async fn run(
         &config.workspace_dir,
     ));
 
+    // ── Hooks (lifecycle event handlers) ─────────────────────────
+    let hooks: Option<crate::hooks::HookRunner> = if config.hooks.enabled {
+        let mut runner = crate::hooks::HookRunner::new();
+        if config.hooks.builtin.command_logger {
+            runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
+        }
+        if config.hooks.builtin.webhook_audit.enabled {
+            runner.register(Box::new(crate::hooks::builtin::WebhookAuditHook::new(
+                config.hooks.builtin.webhook_audit.clone(),
+            )));
+        }
+        Some(runner)
+    } else {
+        None
+    };
+
     // ── Memory (the brain) ────────────────────────────────────────
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes(
         &config.memory,
@@ -3999,6 +4045,26 @@ pub async fn run(
         .or(config.default_model.as_deref())
         .unwrap_or("anthropic/claude-sonnet-4")
         .to_string();
+
+    // Run modifying hook before provider creation
+    if let Some(ref hooks) = hooks {
+        match hooks
+            .run_before_model_resolve(provider_name.clone(), model_name.clone())
+            .await
+        {
+            crate::hooks::HookResult::Continue((new_provider, new_model)) => {
+                provider_name = new_provider;
+                model_name = new_model;
+            }
+            crate::hooks::HookResult::Cancel(reason) => {
+                tracing::warn!(reason = %reason, "Model resolution cancelled by before_model_resolve hook");
+                return Err(anyhow::anyhow!(
+                    "Model resolution cancelled by hook: {}",
+                    reason
+                ));
+            }
+        }
+    }
 
     let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
 
@@ -4204,6 +4270,22 @@ pub async fn run(
         system_prompt.push_str(&deferred_section);
     }
 
+    // Run modifying hook before prompt is finalized
+    if let Some(ref hooks) = hooks {
+        match hooks.run_before_prompt_build(system_prompt.clone()).await {
+            crate::hooks::HookResult::Continue(modified_prompt) => {
+                system_prompt = modified_prompt;
+            }
+            crate::hooks::HookResult::Cancel(reason) => {
+                tracing::warn!(reason = %reason, "Prompt build cancelled by before_prompt_build hook");
+                return Err(anyhow::anyhow!(
+                    "Prompt build cancelled by hook: {}",
+                    reason
+                ));
+            }
+        }
+    }
+
     // ── Approval manager (supervised mode) ───────────────────────
     let approval_manager = if interactive {
         Some(ApprovalManager::from_config(&config.autonomy))
@@ -4325,7 +4407,7 @@ pub async fn run(
                 config.agent.max_tool_iterations,
                 None,
                 None,
-                None,
+                hooks.as_ref(),
                 &excluded_tools,
                 &config.agent.tool_call_dedup_exempt,
                 activated_handle.as_ref(),
@@ -4626,7 +4708,7 @@ pub async fn run(
                     config.agent.max_tool_iterations,
                     Some(cancel_token.clone()),
                     Some(delta_tx.clone()),
-                    None,
+                    hooks.as_ref(),
                     &excluded_tools,
                     &config.agent.tool_call_dedup_exempt,
                     activated_handle.as_ref(),
